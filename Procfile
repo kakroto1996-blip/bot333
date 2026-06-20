@@ -1,6 +1,1 @@
-# Libraries #
-import os
-from dotenv import load_dotenv
-from openai import OpenAI
-
-load_dotenv(override=True)
+web: uvicorn main:app --host 0.0.0.0 --port $PORT
