@@ -110,6 +110,7 @@ def verify():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json or {}
+    print(f"DEBUG_RECEIVED: {json.dumps(data)}")
 
     if data.get("object") != "whatsapp_business_account":
         return jsonify({"status": "ignored"}), 200
