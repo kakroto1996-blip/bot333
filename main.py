@@ -110,7 +110,11 @@ def verify():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json or {}
-    print(f"DEBUG_RECEIVED: {json.dumps(data)}")
+    print(f"DEBUG_ALL_DATA: {json.dumps(data)}") 
+    
+    # التحقق من نوع البيانات - سنقوم بطباعته أيضاً
+    obj = data.get("object")
+    print(f"DEBUG_OBJECT: {obj}")
 
     if data.get("object") != "whatsapp_business_account":
         return jsonify({"status": "ignored"}), 200
