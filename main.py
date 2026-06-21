@@ -163,25 +163,22 @@ def log_to_sheet(whatsapp_phone: str, name: str, national_id: str, contact_phone
 # ─── Gmail Notification (عبر SMTP بكلمة مرور تطبيق) ──────────────────────────
 def send_notification_email(whatsapp_phone: str, name: str, national_id: str, contact_phone: str) -> None:
     if not (SMTP_EMAIL and SMTP_APP_PASSWORD and NOTIFY_EMAIL):
-        log.warning("إعدادات البريد غير مُفعّلة - تم تخطي إرسال الإشعار")
+        log.warning("إعدادات البريد غير مُفعّلة")
         return
 
-    body = (
-        "عميل جديد ينتظر التواصل:\n\n"
-        f"الاسم: {name}\n"
-        f"رقم الهوية: {national_id}\n"
-        f"رقم الجوال: {contact_phone}\n"
-        f"رقم واتساب: {whatsapp_phone}\n"
-    )
+    body = (...) # (نفس النص الخاص بك)
     msg = MIMEText(body, _charset="utf-8")
     msg["Subject"] = f"عميل جديد يحتاج للتواصل - {name}"
     msg["From"] = SMTP_EMAIL
     msg["To"] = NOTIFY_EMAIL
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
-            server.send_message(msg)
+        # التغيير هنا: استخدام SMTP بدلاً من SMTP_SSL والمنفذ 587
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls() # تفعيل التشفير
+        server.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
         log.info("تم إرسال إشعار البريد لـ %s", whatsapp_phone)
     except Exception as e:
         log.error("فشل إرسال إشعار البريد: %s", e)
