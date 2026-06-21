@@ -34,7 +34,7 @@ DB_PATH          = os.environ.get("DB_PATH", "sessions.db")
 
 WA_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 
-SYSTEM_PROMPT = """الدور: أنت مساعد ذكي ومحترف لخدمة العملاء.
+SYSTEM_PROMPT = SYSTEM_PROMPT = """الدور: أنت مساعد ذكي ومحترف لخدمة العملاء.
 سياسة اللغة: تواصل باللغة العربية الفصحى فقط.
 
 مهمتك: جمع 3 معلومات خطوة بخطوة (معلومة واحدة في كل رسالة):
@@ -42,16 +42,17 @@ SYSTEM_PROMPT = """الدور: أنت مساعد ذكي ومحترف لخدمة 
 2. رقم الهوية
 3. رقم الجوال
 
-قواعد:
-- معلومة واحدة فقط في كل رسالة، لا تجمع سؤالين
-- إذا أرسل المستخدم زر (تتبع الطلب أو الدعم الفني) ابدأ بطلب الاسم الثلاثي
-- كن مهذباً ومحترفاً
+قواعد صارمة (يجب اتباعها بدقة):
+- لا تطلب أكثر من معلومة واحدة في كل رد.
+- إذا قام المستخدم بتزويدك بمعلومة، لا تطلبها مجدداً، وانتقل فوراً للخطوة التالية.
+- لا تكرر السؤال السابق إذا أجاب المستخدم عليه بالفعل.
+- إذا أرسل المستخدم زر (تتبع الطلب أو الدعم الفني)، ابدأ بطلب الاسم الثلاثي فوراً.
+- التزم بالهيدوء والاحترافية: إذا أرسل المستخدم رسالة لا تحتوي على المعلومة المطلوبة، اطلبها منه بأسلوب مهذب مرة واحدة فقط.
+- ممنوع منعاً باتاً إرسال أكثر من رسالة واحدة في كل رد من طرفك.
 
-بعد جمع المعلومات الثلاث أرسل هذه الرسالة حرفياً مع استبدال البيانات:
+بعد جمع المعلومات الثلاث أرسل هذه الرسالة حرفياً:
 شكراً لك يا [الاسم الثلاثي]. صاحب الهوية ([رقم الهوية]) لقد تم استلام بياناتك بنجاح. نحن نقدر تعاونك معنا. سوف يتم تحويلك للموظف بأسرع وقت.
-
-ثم أضف في آخر ردك: [DONE]"""
-
+أضف في نهاية ردك الأخير حصراً: [DONE]"""
 # ─── OpenRouter client ────────────────────────────────────────────────────────
 ai = OpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -137,21 +138,25 @@ class BotState(TypedDict):
     done: bool
 
 def ai_node(state: BotState) -> BotState:
-    """استدعاء AI وإرجاع الرد."""
+    # 1. إعداد الـ history كما كنت تفعل
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
     for msg in state["messages"]:
         if isinstance(msg, HumanMessage):
-            history.append({"role": "user",      "content": msg.content})
+            history.append({"role": "user", "content": msg.content})
         elif isinstance(msg, AIMessage):
             history.append({"role": "assistant", "content": msg.content})
 
+    # 2. استدعاء النموذج
     response = ai.chat.completions.create(model=MODEL, messages=history)
     reply = response.choices[0].message.content or ""
 
     done = "[DONE]" in reply
     clean = reply.replace("[DONE]", "").strip()
 
+    # 3. الحل: إرسال الرسالة فقط إذا كان الـ state لا يحتوي على هذا الرد مسبقاً
+    # أو نكتفي بإرسالها هنا، ولكن نضبط الـ conditional edges لضمان عدم التكرار
     wa_send_text(state["phone"], clean)
+    
     return {"messages": [AIMessage(content=reply)], "done": done}
 
 def should_end(state: BotState) -> str:
