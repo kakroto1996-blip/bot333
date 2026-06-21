@@ -169,11 +169,18 @@ def handle_message(phone: str, user_input: str) -> None:
     history = load_session(phone)
 
     if not history:
-        # مستخدم جديد - أرسل الأزرار فقط
-        save_session(phone, [])
+        # 1. إرسال الأزرار
         wa_send_buttons(phone)
-        log.info("New user %s - buttons sent", phone)
+        
+        # 2. حفظ رسالة الترحيب في الـ history فوراً لمنع تكرارها
+        welcome_msg = "مرحباً بك! 👋 كيف يمكنني مساعدتك اليوم؟"
+        new_history = [{"role": "assistant", "content": welcome_msg}]
+        save_session(phone, new_history)
+        
+        log.info("New user %s - buttons sent and session initialized", phone)
         return
+    
+    # ... باقي الكود كما هو
 
     # تحويل history إلى LangGraph messages
     messages = []
