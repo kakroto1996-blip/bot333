@@ -8,11 +8,9 @@ import re
 import json
 import logging
 import sqlite3
-import smtplib
 import threading
 import requests
 from datetime import datetime
-from email.mime.text import MIMEText
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Annotated, TypedDict
@@ -43,9 +41,9 @@ DB_PATH          = os.environ.get("DB_PATH", "sessions.db")
 # ─── Google Sheets + Gmail (اختياري: البوت يعمل حتى لو لم تُضبط هذه القيم) ───
 GOOGLE_SHEET_ID              = os.environ.get("GOOGLE_SHEET_ID", "")
 GOOGLE_SERVICE_ACCOUNT_JSON  = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-SMTP_EMAIL                   = os.environ.get("SMTP_EMAIL", "")
-SMTP_APP_PASSWORD            = os.environ.get("SMTP_APP_PASSWORD", "")
-NOTIFY_EMAIL                 = os.environ.get("NOTIFY_EMAIL", SMTP_EMAIL)
+RESEND_API_KEY               = os.environ.get("RESEND_API_KEY", "")
+NOTIFY_FROM_EMAIL            = os.environ.get("NOTIFY_FROM_EMAIL", "onboarding@resend.dev")
+NOTIFY_EMAIL                 = os.environ.get("NOTIFY_EMAIL", "")
 
 WA_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 
@@ -160,26 +158,39 @@ def log_to_sheet(whatsapp_phone: str, name: str, national_id: str, contact_phone
     except Exception as e:
         log.error("فشل حفظ الصف في Google Sheet: %s", e)
 
-# ─── Gmail Notification (عبر SMTP بكلمة مرور تطبيق) ──────────────────────────
+# ─── Gmail Notification (عبر Resend HTTPS API - يعمل على أي خطة Railway) ────
 def send_notification_email(whatsapp_phone: str, name: str, national_id: str, contact_phone: str) -> None:
-    if not (SMTP_EMAIL and SMTP_APP_PASSWORD and NOTIFY_EMAIL):
-        log.warning("إعدادات البريد غير مُفعّلة")
+    if not (RESEND_API_KEY and NOTIFY_EMAIL):
+        log.warning("إعدادات البريد غير مُفعّلة - تم تخطي إرسال الإشعار")
         return
 
-    body = (...) # (نفس النص الخاص بك)
-    msg = MIMEText(body, _charset="utf-8")
-    msg["Subject"] = f"عميل جديد يحتاج للتواصل - {name}"
-    msg["From"] = SMTP_EMAIL
-    msg["To"] = NOTIFY_EMAIL
+    body_html = (
+        "<p>عميل جديد ينتظر التواصل:</p>"
+        f"<p><b>الاسم:</b> {name}<br>"
+        f"<b>رقم الهوية:</b> {national_id}<br>"
+        f"<b>رقم الجوال:</b> {contact_phone}<br>"
+        f"<b>رقم واتساب:</b> {whatsapp_phone}</p>"
+    )
 
     try:
-        # التغيير هنا: استخدام SMTP بدلاً من SMTP_SSL والمنفذ 587
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls() # تفعيل التشفير
-        server.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
-        server.send_message(msg)
-        server.quit()
-        log.info("تم إرسال إشعار البريد لـ %s", whatsapp_phone)
+        r = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": NOTIFY_FROM_EMAIL,
+                "to": [NOTIFY_EMAIL],
+                "subject": f"عميل جديد يحتاج للتواصل - {name}",
+                "html": body_html,
+            },
+            timeout=10,
+        )
+        if r.ok:
+            log.info("تم إرسال إشعار البريد لـ %s", whatsapp_phone)
+        else:
+            log.error("فشل إرسال إشعار البريد: %s", r.text)
     except Exception as e:
         log.error("فشل إرسال إشعار البريد: %s", e)
 
