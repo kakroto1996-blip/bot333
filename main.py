@@ -7,7 +7,9 @@ import os
 import json
 import logging
 import sqlite3
+import threading
 import requests
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Annotated, TypedDict
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -34,7 +36,7 @@ DB_PATH          = os.environ.get("DB_PATH", "sessions.db")
 
 WA_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 
-SYSTEM_PROMPT = SYSTEM_PROMPT = """الدور: أنت مساعد ذكي ومحترف لخدمة العملاء.
+SYSTEM_PROMPT = """الدور: أنت مساعد ذكي ومحترف لخدمة العملاء.
 سياسة اللغة: تواصل باللغة العربية الفصحى فقط.
 
 مهمتك: جمع 3 معلومات خطوة بخطوة (معلومة واحدة في كل رسالة):
@@ -53,6 +55,7 @@ SYSTEM_PROMPT = SYSTEM_PROMPT = """الدور: أنت مساعد ذكي ومحت
 بعد جمع المعلومات الثلاث أرسل هذه الرسالة حرفياً:
 شكراً لك يا [الاسم الثلاثي]. صاحب الهوية ([رقم الهوية]) لقد تم استلام بياناتك بنجاح. نحن نقدر تعاونك معنا. سوف يتم تحويلك للموظف بأسرع وقت.
 أضف في نهاية ردك الأخير حصراً: [DONE]"""
+
 # ─── OpenRouter client ────────────────────────────────────────────────────────
 ai = OpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -62,6 +65,7 @@ ai = OpenAI(
 # ─── SQLite Sessions ──────────────────────────────────────────────────────────
 def init_db() -> None:
     con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA journal_mode=WAL;")  # يحسّن التزامن عند الكتابة المتعددة
     con.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             phone TEXT PRIMARY KEY,
@@ -95,6 +99,15 @@ def delete_session(phone: str) -> None:
     con.commit()
     con.close()
     log.info("Session deleted for %s", phone)
+
+# ─── Per-Phone Locks ──────────────────────────────────────────────────────────
+# يمنع تضارب معالجة رسالتين متتاليتين من نفس العميل في نفس الوقت
+_phone_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+_locks_guard = threading.Lock()  # يحمي القاموس نفسه عند إنشاء قفل جديد
+
+def get_phone_lock(phone: str) -> threading.Lock:
+    with _locks_guard:
+        return _phone_locks[phone]
 
 # ─── WhatsApp API ─────────────────────────────────────────────────────────────
 def _wa_headers() -> dict:
@@ -138,7 +151,7 @@ class BotState(TypedDict):
     done: bool
 
 def ai_node(state: BotState) -> BotState:
-    # 1. إعداد الـ history كما كنت تفعل
+    # 1. إعداد الـ history
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
     for msg in state["messages"]:
         if isinstance(msg, HumanMessage):
@@ -153,59 +166,57 @@ def ai_node(state: BotState) -> BotState:
     done = "[DONE]" in reply
     clean = reply.replace("[DONE]", "").strip()
 
-    # 3. الحل: إرسال الرسالة فقط إذا كان الـ state لا يحتوي على هذا الرد مسبقاً
-    # أو نكتفي بإرسالها هنا، ولكن نضبط الـ conditional edges لضمان عدم التكرار
+    # 3. إرسال الرد على واتساب
     wa_send_text(state["phone"], clean)
-    
+
     return {"messages": [AIMessage(content=reply)], "done": done}
 
-def should_end(state: BotState) -> str:
-    return END if state.get("done") else "ai"
-
-# بناء الجراف
+# بناء الجراف — عقدة واحدة تُنفَّذ مرة واحدة بالضبط لكل رسالة واردة
+# (لا يوجد self-loop على "ai"؛ التكرار عبر خطوات المحادثة يحدث عبر طلبات Webhook المتتالية لا داخل الـ Graph)
 builder = StateGraph(BotState)
 builder.add_node("ai", ai_node)
 builder.set_entry_point("ai")
 builder.add_edge("ai", END)
 graph = builder.compile()
+
 # ─── Core Logic ───────────────────────────────────────────────────────────────
 def handle_message(phone: str, user_input: str) -> None:
-    history = load_session(phone)
+    lock = get_phone_lock(phone)
+    with lock:
+        history = load_session(phone)
 
-    if not history:
-        # 1. إرسال الأزرار
-        wa_send_buttons(phone)
-        
-        # 2. حفظ رسالة الترحيب في الـ history فوراً لمنع تكرارها
-        welcome_msg = "مرحباً بك! 👋 كيف يمكنني مساعدتك اليوم؟"
-        new_history = [{"role": "assistant", "content": welcome_msg}]
-        save_session(phone, new_history)
-        
-        log.info("New user %s - buttons sent and session initialized", phone)
-        return
-    
-    # ... باقي الكود كما هو
+        if not history:
+            # 1. إرسال الأزرار
+            wa_send_buttons(phone)
 
-    # تحويل history إلى LangGraph messages
-    messages = []
-    for item in history:
-        if item["role"] == "user":
-            messages.append(HumanMessage(content=item["content"]))
+            # 2. حفظ رسالة الترحيب في الـ history فوراً لمنع تكرارها
+            welcome_msg = "مرحباً بك! 👋 كيف يمكنني مساعدتك اليوم؟"
+            new_history = [{"role": "assistant", "content": welcome_msg}]
+            save_session(phone, new_history)
+
+            log.info("New user %s - buttons sent and session initialized", phone)
+            return
+
+        # تحويل history إلى LangGraph messages
+        messages = []
+        for item in history:
+            if item["role"] == "user":
+                messages.append(HumanMessage(content=item["content"]))
+            else:
+                messages.append(AIMessage(content=item["content"]))
+        messages.append(HumanMessage(content=user_input))
+
+        state = graph.invoke({"messages": messages, "phone": phone, "done": False})
+
+        if state.get("done"):
+            delete_session(phone)
         else:
-            messages.append(AIMessage(content=item["content"]))
-    messages.append(HumanMessage(content=user_input))
-
-    state = graph.invoke({"messages": messages, "phone": phone, "done": False})
-
-    if state.get("done"):
-        delete_session(phone)
-    else:
-        # حفظ المحادثة المحدّثة
-        new_history = history + [
-            {"role": "user",      "content": user_input},
-            {"role": "assistant", "content": state["messages"][-1].content},
-        ]
-        save_session(phone, new_history)
+            # حفظ المحادثة المحدّثة
+            new_history = history + [
+                {"role": "user",      "content": user_input},
+                {"role": "assistant", "content": state["messages"][-1].content},
+            ]
+            save_session(phone, new_history)
 
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 @asynccontextmanager
