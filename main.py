@@ -166,9 +166,8 @@ def should_end(state: BotState) -> str:
 builder = StateGraph(BotState)
 builder.add_node("ai", ai_node)
 builder.set_entry_point("ai")
-builder.add_conditional_edges("ai", should_end, {"ai": "ai", END: END})
+builder.add_edge("ai", END)
 graph = builder.compile()
-
 # ─── Core Logic ───────────────────────────────────────────────────────────────
 def handle_message(phone: str, user_input: str) -> None:
     history = load_session(phone)
