@@ -1,11 +1,12 @@
 """
 WhatsApp AI Chatbot - FastAPI + LangGraph + OpenRouter
-سريع، موثوق، ويدعم العربية بشكل كامل + لوحة تحكم مصغرة مدمجة
+دمج نظام الأسئلة المتسلسلة (main 2) مع لوحة الإدارة والداشبورد (main 4)
 """
 
 import os
 import re
 import json
+import hashlib
 import logging
 import sqlite3
 import threading
@@ -14,7 +15,7 @@ from datetime import datetime
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Annotated, TypedDict
-from fastapi import FastAPI, Request, BackgroundTasks, Form
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse, RedirectResponse
 from openai import OpenAI
 from langgraph.graph import StateGraph, END
@@ -37,7 +38,10 @@ VERIFY_TOKEN     = os.environ["WHATSAPP_VERIFY_TOKEN"]
 OPENROUTER_KEY   = os.environ["OPENROUTER_API_KEY"]
 MODEL            = os.environ.get("AI_MODEL", "openai/gpt-4o-mini")
 DB_PATH          = os.environ.get("DB_PATH", "sessions.db")
+COMPANY_INFO     = os.environ.get("COMPANY_INFO", "لا تتوفر معلومات عن الشركة حالياً.")
+ADMIN_PASSWORD   = os.environ.get("ADMIN_PASSWORD", "")
 
+# ─── Google Sheets + Gmail (اختياري) ──────────────────────────────────────────
 GOOGLE_SHEET_ID              = os.environ.get("GOOGLE_SHEET_ID", "")
 GOOGLE_SERVICE_ACCOUNT_JSON  = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 RESEND_API_KEY               = os.environ.get("RESEND_API_KEY", "")
@@ -46,10 +50,17 @@ NOTIFY_EMAIL                 = os.environ.get("NOTIFY_EMAIL", "")
 
 WA_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 
-SYSTEM_PROMPT = """الدور: أنت مساعد ذكي ومحترف لخدمة العملاء.
+# ─── System Prompt (نظام الأسئلة المتسلسلة من main 2 مع معلومات الشركة) ──────
+def build_system_prompt() -> str:
+    return f"""الدور: أنت مساعد ذكي ومحترف لخدمة العملاء.
 سياسة اللغة: تواصل باللغة العربية الفصحى فقط.
 
-مهمتك: جمع 3 معلومات خطوة بخطوة (معلومة واحدة في كل رسالة):
+معلومات عن الشركة (استخدمها للرد على استفسارات العميل العامة قبل أو أثناء جمع البيانات):
+---
+{COMPANY_INFO}
+---
+
+مهمتك الأساسية: عند طلب تتبع طلب أو دعم فني، يجب جمع 3 معلومات خطوة بخطوة (معلومة واحدة في كل رسالة):
 1. الاسم الثلاثي
 2. رقم الهوية
 3. رقم الجوال
@@ -59,10 +70,10 @@ SYSTEM_PROMPT = """الدور: أنت مساعد ذكي ومحترف لخدمة 
 - إذا قام المستخدم بتزويدك بمعلومة، لا تطلبها مجدداً، وانتقل فوراً للخطوة التالية.
 - لا تكرر السؤال السابق إذا أجاب المستخدم عليه بالفعل.
 - إذا أرسل المستخدم زر (تتبع الطلب أو الدعم الفني)، ابدأ بطلب الاسم الثلاثي فوراً.
-- التزم بالهيدوء والاحترافية: إذا أرسل المستخدم رسالة لا تحتوي على المعلومة المطلوبة، اطلبها منه بأسلوب مهذب مرة واحدة فقط.
+- التزم بالهدوء والاحترافية: إذا أرسل المستخدم رسالة لا تحتوي على المعلومة المطلوبة، اطلبها منه بأسلوب مهذب مرة واحدة فقط.
 - ممنوع منعاً باتاً إرسال أكثر من رسالة واحدة في كل رد من طرفك.
 
-بعد جمع المعلومات الثلاث أرسل هذه الرسالة حرفياً:
+بعد جمع المعلومات الثلاث أرسل هذه الرسالة حرفياً ودون أي تعديل:
 شكراً لك يا [الاسم الثلاثي]. صاحب الهوية ([رقم الهوية]) لقد تم استلام بياناتك بنجاح. نحن نقدر تعاونك معنا. سوف يتم تحويلك للموظف بأسرع وقت.
 أضف في نهاية ردك الأخير حصراً: [DONE]"""
 
@@ -80,7 +91,25 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS sessions (
             phone TEXT PRIMARY KEY,
             history TEXT NOT NULL DEFAULT '[]',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            phone TEXT PRIMARY KEY,
             status TEXT NOT NULL DEFAULT 'bot',
+            customer_name TEXT,
+            national_id TEXT,
+            contact_phone TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS messages_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            content TEXT NOT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -94,12 +123,12 @@ def load_session(phone: str) -> list[dict]:
     con.close()
     return json.loads(row[0]) if row else []
 
-def save_session(phone: str, history: list[dict], status: str = "bot") -> None:
+def save_session(phone: str, history: list[dict]) -> None:
     con = sqlite3.connect(DB_PATH)
     con.execute(
-        "INSERT INTO sessions (phone, history, status) VALUES (?,?,?,?) "
-        "ON CONFLICT(phone) DO UPDATE SET history=excluded.history, status=excluded.status",
-        (phone, json.dumps(history, ensure_ascii=False), status),
+        "INSERT INTO sessions (phone, history) VALUES (?,?) "
+        "ON CONFLICT(phone) DO UPDATE SET history=excluded.history",
+        (phone, json.dumps(history, ensure_ascii=False)),
     )
     con.commit()
     con.close()
@@ -111,30 +140,69 @@ def delete_session(phone: str) -> None:
     con.close()
     log.info("Session deleted for %s", phone)
 
-def get_all_agent_sessions() -> list[dict]:
+# ─── سجل المحادثات الدائم والداشبورد ──────────────────────────────────────────
+def log_message(phone: str, sender: str, content: str) -> None:
     con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    rows = con.execute("SELECT phone, history FROM sessions WHERE status='agent'").fetchall()
+    con.execute(
+        "INSERT INTO messages_log (phone, sender, content) VALUES (?,?,?)",
+        (phone, sender, content),
+    )
+    con.execute(
+        "INSERT INTO conversations (phone, updated_at) VALUES (?, CURRENT_TIMESTAMP) "
+        "ON CONFLICT(phone) DO UPDATE SET updated_at=CURRENT_TIMESTAMP",
+        (phone,),
+    )
+    con.commit()
     con.close()
-    
-    result = []
-    for r in rows:
-        history = json.loads(r["history"])
-        name = r["phone"]
-        for msg in reversed(history):
-            if msg["role"] == "assistant" and "شكراً لك يا" in msg["content"]:
-                match = re.search(r"شكراً لك يا (.+?)\.", msg["content"])
-                if match:
-                    name = match.group(1).strip()
-                    break
-        
-        clean_history = []
-        for msg in history:
-            clean_content = msg["content"].replace("[DONE]", "").strip()
-            clean_history.append({"role": msg["role"], "content": clean_content})
 
-        result.append({"phone": r["phone"], "name": name, "history": clean_history})
-    return result
+def get_conversation_status(phone: str) -> str:
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT status FROM conversations WHERE phone=?", (phone,)).fetchone()
+    con.close()
+    return row[0] if row else "bot"
+
+def set_conversation_status(
+    phone: str, status: str,
+    name: str | None = None, national_id: str | None = None, contact_phone: str | None = None,
+) -> None:
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "INSERT INTO conversations (phone, status, customer_name, national_id, contact_phone, updated_at) "
+        "VALUES (?,?,?,?,?, CURRENT_TIMESTAMP) "
+        "ON CONFLICT(phone) DO UPDATE SET "
+        "status=excluded.status, "
+        "customer_name=COALESCE(excluded.customer_name, conversations.customer_name), "
+        "national_id=COALESCE(excluded.national_id, conversations.national_id), "
+        "contact_phone=COALESCE(excluded.contact_phone, conversations.contact_phone), "
+        "updated_at=CURRENT_TIMESTAMP",
+        (phone, status, name, national_id, contact_phone),
+    )
+    con.commit()
+    con.close()
+
+def list_conversations() -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT phone, status, customer_name, national_id, contact_phone, updated_at "
+        "FROM conversations ORDER BY updated_at DESC"
+    ).fetchall()
+    con.close()
+    return [
+        {
+            "phone": r[0], "status": r[1], "customer_name": r[2],
+            "national_id": r[3], "contact_phone": r[4], "updated_at": r[5],
+        }
+        for r in rows
+    ]
+
+def get_messages(phone: str) -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT sender, content, created_at FROM messages_log WHERE phone=? ORDER BY id ASC",
+        (phone,),
+    ).fetchall()
+    con.close()
+    return [{"sender": r[0], "content": r[1], "created_at": r[2]} for r in rows]
 
 # ─── Per-Phone Locks ──────────────────────────────────────────────────────────
 _phone_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
@@ -184,11 +252,10 @@ def log_to_sheet(whatsapp_phone: str, name: str, national_id: str, contact_phone
 # ─── Email Notification ───────────────────────────────────────────────────────
 def send_notification_email(whatsapp_phone: str, name: str, national_id: str, contact_phone: str) -> None:
     if not (RESEND_API_KEY and NOTIFY_EMAIL):
-        log.warning("إعدادات البريد غير مُفعّلة - تم تخطي إرسال الإشعار")
         return
 
     body_html = (
-        "<p>عميل جديد ينتظر التواصل:</p>"
+        "<p>عميل جديد ينتظر التواصل (تم جمع بياناته عبر البوت التلقائي):</p>"
         f"<p><b>الاسم:</b> {name}<br>"
         f"<b>رقم الهوية:</b> {national_id}<br>"
         f"<b>رقم الجوال:</b> {contact_phone}<br>"
@@ -198,10 +265,7 @@ def send_notification_email(whatsapp_phone: str, name: str, national_id: str, co
     try:
         r = requests.post(
             "https://api.resend.com/emails",
-            headers={
-                "Authorization": f"Bearer {RESEND_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
             json={
                 "from": NOTIFY_FROM_EMAIL,
                 "to": [NOTIFY_EMAIL],
@@ -212,11 +276,10 @@ def send_notification_email(whatsapp_phone: str, name: str, national_id: str, co
         )
         if r.ok:
             log.info("تم إرسال إشعار البريد لـ %s", whatsapp_phone)
-        else:
-            log.error("فشل إرسال إشعار البريد: %s", r.text)
     except Exception as e:
         log.error("فشل إرسال إشعار البريد: %s", e)
 
+# ─── استخراج بيانات العميل تلقائياً عند انتهاء المحادثة النصية ─────────────────
 def extract_customer_data(final_message: str, last_user_input: str) -> dict | None:
     match = re.search(r"شكراً لك يا (.+?)\.\s*صاحب الهوية \((.+?)\)", final_message)
     if not match:
@@ -262,6 +325,8 @@ def wa_send_buttons(to: str) -> None:
     r = requests.post(WA_URL, json=payload, headers=_wa_headers(), timeout=10)
     if not r.ok:
         log.error("WhatsApp buttons error: %s", r.text)
+    else:
+        log_message(to, "bot", "[أزرار] مرحباً بك! 👋 كيف يمكنني مساعدتك اليوم؟")
 
 # ─── LangGraph State ──────────────────────────────────────────────────────────
 class BotState(TypedDict):
@@ -270,7 +335,7 @@ class BotState(TypedDict):
     done: bool
 
 def ai_node(state: BotState) -> BotState:
-    history = [{"role": "system", "content": SYSTEM_PROMPT}]
+    history = [{"role": "system", "content": build_system_prompt()}]
     for msg in state["messages"]:
         if isinstance(msg, HumanMessage):
             history.append({"role": "user", "content": msg.content})
@@ -284,6 +349,8 @@ def ai_node(state: BotState) -> BotState:
     clean = reply.replace("[DONE]", "").strip()
 
     wa_send_text(state["phone"], clean)
+    log_message(state["phone"], "bot", clean)
+
     return {"messages": [AIMessage(content=reply)], "done": done}
 
 builder = StateGraph(BotState)
@@ -296,31 +363,14 @@ graph = builder.compile()
 def handle_message(phone: str, user_input: str) -> None:
     lock = get_phone_lock(phone)
     with lock:
-        con = sqlite3.connect(DB_PATH)
-        row = con.execute("SELECT status FROM sessions WHERE phone=?", (phone,)).fetchone()
-        con.close()
-        if row and row[0] == "agent":
-            history = load_session(phone)
-            history.append({"role": "user", "content": user_input})
-            save_session(phone, history, status="agent")
-            return
-
         history = load_session(phone)
 
-        # إذا ضغط المستخدم على الأزرار لأول مرة أو أرسل كلمة ترحيبية وليس هناك سجل
-        # أو إذا كانت كلمة الإدخال هي أحد عناوين الأزرار نفسها لضمان المزامنة
-        is_button_click = user_input in ["📦 تتبع الطلب", "🛠 الدعم الفني"]
-
-        if not history and not is_button_click:
+        if not history:
             wa_send_buttons(phone)
             welcome_msg = "مرحباً بك! 👋 كيف يمكنني مساعدتك اليوم؟"
             new_history = [{"role": "assistant", "content": welcome_msg}]
-            save_session(phone, new_history, status="bot")
+            save_session(phone, new_history)
             return
-
-        # إذا كانت جلسة جديدة ولكن دخل بضغطة زر مباشرة، نقوم بإنشاء سجل تمهيدي له
-        if not history and is_button_click:
-            history = [{"role": "assistant", "content": "مرحباً بك! 👋 كيف يمكنني مساعدتك اليوم؟"}]
 
         messages = []
         for item in history:
@@ -332,22 +382,29 @@ def handle_message(phone: str, user_input: str) -> None:
 
         state = graph.invoke({"messages": messages, "phone": phone, "done": False})
 
-        new_history = history + [
-            {"role": "user",      "content": user_input},
-            {"role": "assistant", "content": state["messages"][-1].content},
-        ]
-
         if state.get("done"):
             final_message = state["messages"][-1].content
             data = extract_customer_data(final_message, user_input)
             if data:
+                # تخزين البيانات في الداشبورد وتغيير الحالة لتنبيه الموظف
+                set_conversation_status(
+                    phone, "handed_off", 
+                    name=data["name"], 
+                    national_id=data["national_id"], 
+                    contact_phone=data["contact_phone"]
+                )
                 log_to_sheet(phone, data["name"], data["national_id"], data["contact_phone"])
                 send_notification_email(phone, data["name"], data["national_id"], data["contact_phone"])
-            
-            save_session(phone, new_history, status="agent")
-            log.info("Conversation successfully completed and routed to dashboard for %s", phone)
+            else:
+                set_conversation_status(phone, "handed_off")
+                
+            delete_session(phone)  # تصفير الجلسة التلقائية بعد تسليمها للموظف
         else:
-            save_session(phone, new_history, status="bot")
+            new_history = history + [
+                {"role": "user",      "content": user_input},
+                {"role": "assistant", "content": state["messages"][-1].content},
+            ]
+            save_session(phone, new_history)
 
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -358,10 +415,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="WhatsApp AI Bot", lifespan=lifespan)
 
-# تحويل الرابط الرئيسي تلقائياً للـ Dashboard لمنع خطأ 404
-@app.get("/")
-def home_redirect():
-    return RedirectResponse(url="/dashboard")
 
 @app.get("/webhook")
 def verify(request: Request):
@@ -371,6 +424,7 @@ def verify(request: Request):
         return PlainTextResponse(params.get("hub.challenge", ""))
     return PlainTextResponse("Forbidden", status_code=403)
 
+
 @app.post("/webhook")
 async def webhook(request: Request, background: BackgroundTasks):
     data = await request.json()
@@ -379,142 +433,343 @@ async def webhook(request: Request, background: BackgroundTasks):
         return JSONResponse({"status": "ignored"})
 
     try:
-        value = data["entry"][0]["changes"][0]["value"]
+        value    = data["entry"][0]["changes"][0]["value"]
         messages = value.get("messages")
         if not messages:
             return JSONResponse({"status": "no_messages"})
 
-        message = messages[0]
+        message     = messages[0]
         from_number = message["from"]
-        display = value["metadata"]["display_phone_number"]
+        display     = value["metadata"]["display_phone_number"]
 
         if from_number == display:
             return JSONResponse({"status": "self"})
 
         msg_type = message.get("type")
+        
+        # إذا كانت المحادثة محولة للموظف (handed_off)، لن يقوم البوت بالرد التلقائي، فقط يسجل الرسائل في الداشبورد
+        is_handed_off = get_conversation_status(from_number) == "handed_off"
+
         if msg_type == "text":
             user_input = message["text"]["body"].strip()
+            log_message(from_number, "customer", user_input)
+
+            if not is_handed_off:
+                background.add_task(handle_message, from_number, user_input)
+
         elif msg_type == "interactive":
-            user_input = message["interactive"]["button_reply"]["title"]
+            interactive_type = message["interactive"].get("type")
+
+            if interactive_type == "button_reply":
+                button_title = message["interactive"]["button_reply"]["title"]
+                log_message(from_number, "customer", f"[زر] {button_title}")
+
+                if not is_handed_off:
+                    # نرسل عنوان الزر مباشرة للموديل ليبدأ بطلب الاسم الثلاثي بناءً على شروط الـ System Prompt
+                    background.add_task(handle_message, from_number, button_title)
+
+            else:
+                return JSONResponse({"status": "unsupported_interactive"})
         else:
             return JSONResponse({"status": "unsupported"})
-
-        background.add_task(handle_message, from_number, user_input)
 
     except (KeyError, IndexError) as e:
         log.warning("Parse error: %s", e)
 
     return JSONResponse({"status": "ok"})
 
+
 @app.get("/health")
 def health():
     return {"status": "running", "model": MODEL}
 
-# ─── 🎛️ قسم لوحة التحكم المصغرة ──────────────────────────────────────────────────
 
-DASHBOARD_HTML = """
-<!DOCTYPE html>
+# ─── لوحة الإدارة (Admin Dashboard HTML) ──────────────────────────────────────
+def _admin_token() -> str:
+    return hashlib.sha256(ADMIN_PASSWORD.encode()).hexdigest()
+
+def _is_admin(request: Request) -> bool:
+    return bool(ADMIN_PASSWORD) and request.cookies.get("admin_token") == _admin_token()
+
+LOGIN_HTML = """<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-    <meta charset="UTF-8">
-    <title>لوحة الدعم المصغرة</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&display=swap" rel="stylesheet">
-    <style> body { font-family: 'Cairo', sans-serif; } </style>
-    <meta http-equiv="refresh" content="10">
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>تسجيل الدخول</title>
+<style>
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#0f1115;color:#e6e6e6;display:flex;align-items:center;justify-content:center;height:100vh}
+  .card{background:#171a21;padding:32px;border-radius:14px;width:320px;box-shadow:0 4px 24px rgba(0,0,0,.4)}
+  h1{font-size:18px;margin:0 0 20px;font-weight:700}
+  input{width:100%;padding:11px;border-radius:8px;border:1px solid #2a2e38;background:#0f1115;color:#e6e6e6;margin-bottom:14px;box-sizing:border-box;font-size:14px}
+  button{width:100%;padding:11px;border-radius:8px;border:none;background:#3b82f6;color:#fff;font-weight:600;cursor:pointer;font-size:14px}
+  button:hover{background:#2563eb}
+  .err{color:#f87171;font-size:13px;margin-bottom:12px}
+</style>
 </head>
-<body class="bg-gray-100 min-h-screen flex flex-col">
-    <header class="bg-blue-600 text-white p-4 shadow-md flex justify-between items-center">
-        <h1 class="text-lg font-bold">📲 واجهة الموظف البشري لمتابعة محادثات واتساب</h1>
-        <span class="bg-blue-700 px-3 py-1 rounded text-xs">تحديث تلقائي كل 10 ثوانٍ</span>
-    </header>
-
-    <main class="flex-1 p-4 max-w-6xl w-full mx-auto grid grid-cols-1 md:grid-cols-3 gap-4">
-        <div class="bg-white rounded-lg shadow p-3 col-span-1 overflow-y-auto max-h-[78vh]">
-            <h2 class="font-bold text-gray-700 mb-3 border-b pb-1 text-sm">📥 عملاء جاهزون للرد</h2>
-            {% if not sessions %}
-                <p class="text-gray-400 text-center py-6 text-xs">لا توجد محادثات بانتظارك حالياً.</p>
-            {% endif %}
-            {% for s in sessions %}
-                <a href="?active={{ s.phone }}" class="block p-3 mb-2 rounded border {% if active_phone == s.phone %}bg-blue-50 border-blue-400{% else %}bg-gray-50 hover:bg-gray-100 border-gray-200{% endif %} transition text-xs">
-                    <div class="font-bold text-gray-800">{{ s.name }}</div>
-                    <div class="text-gray-500 mt-0.5">رقم: {{ s.phone }}</div>
-                </a>
-            {% endfor %}
-        </div>
-
-        <div class="bg-white rounded-lg shadow col-span-2 flex flex-col max-h-[78vh]">
-            {% if active_session %}
-                <div class="p-3 border-b bg-gray-50 flex justify-between items-center rounded-t-lg">
-                    <div class="text-xs">
-                        <h3 class="font-bold text-gray-800">{{ active_session.name }}</h3>
-                        <p class="text-gray-500">واتساب: {{ active_session.phone }}</p>
-                    </div>
-                    <form action="/dashboard/close" method="post">
-                        <input type="hidden" name="phone" value="{{ active_session.phone }}">
-                        <button type="submit" class="bg-red-500 text-white px-3 py-1 rounded text-xs hover:bg-red-600 transition">إنهاء المحادثة وحذفها</button>
-                    </form>
-                </div>
-
-                <div class="flex-1 p-3 overflow-y-auto space-y-3 bg-gray-50/50">
-                    {% for msg in active_session.history %}
-                        {% if msg.role == 'user' %}
-                            <div class="flex justify-start">
-                                <div class="bg-white text-gray-800 rounded-lg p-3 max-w-sm shadow-sm border text-xs">
-                                    <span class="block text-[10px] font-bold text-blue-600 mb-0.5">العميل</span>
-                                    {{ msg.content }}
-                                </div>
-                            </div>
-                        {% else %}
-                            <div class="flex justify-end">
-                                <div class="bg-blue-600 text-white rounded-lg p-3 max-w-sm shadow-sm text-xs">
-                                    <span class="block text-[10px] font-bold text-blue-200 mb-0.5">النظام / أنت</span>
-                                    {{ msg.content }}
-                                </div>
-                            </div>
-                        {% endif %}
-                    {% endfor %}
-                </div>
-
-                <div class="p-3 border-t bg-white rounded-b-lg">
-                    <form action="/dashboard/reply" method="post" class="flex gap-2">
-                        <input type="hidden" name="phone" value="{{ active_session.phone }}">
-                        <input type="text" name="message" required placeholder="اكتب ردك المباشر للعميل هنا..." class="flex-1 border rounded px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500">
-                        <button type="submit" class="bg-blue-600 text-white px-4 py-1.5 rounded text-xs hover:bg-blue-700 font-bold transition">إرسال</button>
-                    </form>
-                </div>
-            {% else %}
-                <div class="flex-1 flex flex-col items-center justify-center text-gray-400 p-6 text-sm">
-                    <p>يرجى تحديد عميل من القائمة للبدء بالرد عليه ومتابعة تفاصيل عمله.</p>
-                </div>
-            {% endif %}
-        </div>
-    </main>
+<body>
+  <form class="card" method="post" action="/admin/login">
+    <h1>🔒 لوحة إدارة المحادثات</h1>
+    __ERROR__
+    <input type="password" name="password" placeholder="كلمة المرور" autofocus required>
+    <button type="submit">دخول</button>
+  </form>
 </body>
-</html>
-"""
+</html>"""
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def get_dashboard(request: Request, active: str = None):
-    sessions = get_all_agent_sessions()
-    active_session = None
-    if active:
-        for s in sessions:
-            if s["phone"] == active:
-                active_session = s
-                break
-    from jinja2 import Template
-    return Template(DASHBOARD_HTML).render(sessions=sessions, active_phone=active, active_session=active_session)
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>لوحة المحادثات</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#0f1115;color:#e6e6e6;height:100vh;overflow:hidden}
+  .app{display:flex;height:100vh}
+  .list-pane{width:340px;border-left:1px solid #20242c;display:flex;flex-direction:column;background:#13151b}
+  .list-header{padding:14px 16px;border-bottom:1px solid #20242c;font-weight:700;font-size:15px}
+  .tabs{display:flex;gap:6px;padding:10px 12px;border-bottom:1px solid #20242c}
+  .tab{flex:1;text-align:center;padding:6px 4px;border-radius:6px;font-size:12px;cursor:pointer;background:#1c1f27;color:#9aa0ab}
+  .tab.active{background:#3b82f6;color:#fff}
+  .conv-list{flex:1;overflow-y:auto}
+  .conv-item{padding:12px 16px;border-bottom:1px solid #1b1e25;cursor:pointer;display:flex;flex-direction:column;gap:4px}
+  .conv-item:hover{background:#191c23}
+  .conv-item.selected{background:#1d2330}
+  .conv-top{display:flex;justify-content:space-between;align-items:center}
+  .conv-name{font-weight:600;font-size:14px}
+  .conv-time{font-size:11px;color:#6b7280}
+  .badge{font-size:10px;padding:2px 8px;border-radius:20px;font-weight:600;white-space:nowrap}
+  .badge-bot{background:#1e3a2f;color:#4ade80}
+  .badge-handed_off{background:#3a2e1e;color:#fbbf24}
+  .badge-closed{background:#2a2d35;color:#9aa0ab}
+  .conv-phone{font-size:12px;color:#8b91a0}
+  .metadata-box{background:#1c1f27;padding:10px;border-radius:8px;margin:10px;font-size:13px;border:1px solid #2a2e38}
+  .thread-pane{flex:1;display:flex;flex-direction:column}
+  .thread-header{padding:14px 18px;border-bottom:1px solid #20242c;display:flex;justify-content:space-between;align-items:center}
+  .thread-title{font-weight:700;font-size:15px}
+  .thread-actions{display:flex;gap:8px}
+  .thread-actions button{font-size:12px;padding:6px 12px;border-radius:7px;border:1px solid #2a2e38;background:#1c1f27;color:#e6e6e6;cursor:pointer}
+  .thread-actions button:hover{background:#252933}
+  .messages{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:10px}
+  .msg{max-width:65%;padding:9px 13px;border-radius:12px;font-size:14px;line-height:1.5;white-space:pre-wrap}
+  .msg.customer{align-self:flex-start;background:#1c1f27;border-bottom-left-radius:3px}
+  .msg.bot{align-self:flex-end;background:#1e3a5f;border-bottom-right-radius:3px}
+  .msg.admin{align-self:flex-end;background:#2f6b3f;border-bottom-right-radius:3px}
+  .msg-meta{font-size:10px;color:#6b7280;margin-top:3px}
+  .composer{display:flex;gap:8px;padding:14px;border-top:1px solid #20242c}
+  .composer textarea{flex:1;resize:none;border-radius:10px;border:1px solid #2a2e38;background:#171a21;color:#e6e6e6;padding:10px 12px;font-size:14px;font-family:inherit;height:42px}
+  .composer button{padding:0 18px;border-radius:10px;border:none;background:#3b82f6;color:#fff;font-weight:600;cursor:pointer}
+  .composer button:hover{background:#2563eb}
+  .empty{flex:1;display:flex;align-items:center;justify-content:center;color:#6b7280;font-size:14px}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="list-pane">
+    <div class="list-header">💬 المحادثات</div>
+    <div class="tabs">
+      <div class="tab active" data-f="all">الكل</div>
+      <div class="tab" data-f="handed_off">يحتاج رد</div>
+      <div class="tab" data-f="bot">نشط (بوت)</div>
+      <div class="tab" data-f="closed">مغلق</div>
+    </div>
+    <div class="conv-list" id="convList"></div>
+  </div>
+  <div class="thread-pane">
+    <div id="threadEmpty" class="empty">اختر محادثة من القائمة</div>
+    <div id="threadView" style="display:none;flex:1;display:flex;flex-direction:column">
+      <div class="thread-header">
+        <div>
+          <div class="thread-title" id="threadTitle">—</div>
+          <div class="conv-phone" id="threadPhone">—</div>
+        </div>
+        <div class="thread-actions">
+          <button onclick="setStatus('bot')">🤖 أعد للبوت</button>
+          <button onclick="setStatus('closed')">✅ إغلاق</button>
+        </div>
+      </div>
+      <div id="customerMeta" class="metadata-box" style="display:none;"></div>
+      <div class="messages" id="messages"></div>
+      <div class="composer">
+        <textarea id="replyBox" placeholder="اكتب رداً للعميل..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendReply();}"></textarea>
+        <button onclick="sendReply()">إرسال</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+let currentPhone = null;
+let currentFilter = 'all';
+let allConvs = [];
 
-@app.post("/dashboard/reply")
-def agent_reply(phone: str = Form(...), message: str = Form(...)):
-    wa_send_text(phone, message)
-    history = load_session(phone)
-    history.append({"role": "assistant", "content": message})
-    save_session(phone, history, status="agent")
-    return RedirectResponse(url=f"/dashboard?active={phone}", status_code=303)
+function badgeLabel(s){return {bot:'🤖 يرد البوت', handed_off:'🧑‍💼 يحتاج رد', closed:'✅ مغلق'}[s] || s;}
 
-@app.post("/dashboard/close")
-def agent_close_session(phone: str = Form(...)):
-    delete_session(phone)
-    return RedirectResponse(url="/dashboard", status_code=303)
+async function loadConversations(){
+  const r = await fetch('/admin/api/conversations');
+  if(r.status === 401){ location.href = '/admin/login'; return; }
+  const data = await r.json();
+  allConvs = data.conversations;
+  renderList();
+  if(currentPhone) updateMetadataBox();
+}
+
+function renderList(){
+  const list = document.getElementById('convList');
+  const filtered = currentFilter === 'all' ? allConvs : allConvs.filter(c => c.status === currentFilter);
+  list.innerHTML = filtered.map(c => `
+    <div class="conv-item ${c.phone===currentPhone?'selected':''}" onclick="openConv('${c.phone}')">
+      <div class="conv-top">
+        <span class="conv-name">${c.customer_name || c.phone}</span>
+        <span class="badge badge-${c.status}">${badgeLabel(c.status)}</span>
+      </div>
+      <div class="conv-phone">${c.phone}</div>
+      <div class="conv-time">${c.updated_at || ''}</div>
+    </div>
+  `).join('') || '<div style="padding:20px;color:#6b7280;font-size:13px">لا توجد محادثات</div>';
+}
+
+function updateMetadataBox(){
+  const conv = allConvs.find(c => c.phone === currentPhone);
+  const metaBox = document.getElementById('customerMeta');
+  if(conv && (conv.customer_name || conv.national_id || conv.contact_phone)){
+    metaBox.style.display = 'block';
+    metaBox.innerHTML = `
+      <b>📋 بيانات العميل المستخرجة:</b><br>
+      الاسم: ${conv.customer_name || '—'} | 
+      الهوية: ${conv.national_id || '—'} | 
+      الجوال: ${conv.contact_phone || '—'}
+    `;
+  } else {
+    metaBox.style.display = 'none';
+  }
+}
+
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  currentFilter = t.dataset.f;
+  renderList();
+});
+
+async function openConv(phone){
+  currentPhone = phone;
+  document.getElementById('threadEmpty').style.display = 'none';
+  document.getElementById('threadView').style.display = 'flex';
+  const conv = allConvs.find(c => c.phone === phone);
+  document.getElementById('threadTitle').textContent = (conv && conv.customer_name) || phone;
+  document.getElementById('threadPhone').textContent = phone;
+  renderList();
+  updateMetadataBox();
+  await loadMessages();
+}
+
+async function loadMessages(){
+  if(!currentPhone) return;
+  const r = await fetch('/admin/api/messages/' + encodeURIComponent(currentPhone));
+  if(r.status === 401){ location.href = '/admin/login'; return; }
+  const data = await r.json();
+  const box = document.getElementById('messages');
+  const wasAtBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  box.innerHTML = data.messages.map(m => `
+    <div class="msg ${m.sender}">${escapeHtml(m.content)}<div class="msg-meta">${m.created_at}</div></div>
+  `).join('');
+  if(wasAtBottom) box.scrollTop = box.scrollHeight;
+}
+
+function escapeHtml(s){
+  const d = document.createElement('div'); d.textContent = s; return d.innerHTML;
+}
+
+async function sendReply(){
+  const box = document.getElementById('replyBox');
+  const text = box.value.trim();
+  if(!text || !currentPhone) return;
+  box.value = '';
+  await fetch('/admin/api/reply/' + encodeURIComponent(currentPhone), {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({text})
+  });
+  await loadMessages();
+  await loadConversations();
+}
+
+async function setStatus(status){
+  if(!currentPhone) return;
+  await fetch('/admin/api/status/' + encodeURIComponent(currentPhone), {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({status})
+  });
+  await loadConversations();
+}
+
+loadConversations();
+setInterval(loadConversations, 5000);
+setInterval(loadMessages, 3000);
+</script>
+</body>
+</html>"""
+
+# ─── Admin API Endpoints ──────────────────────────────────────────────────────
+@app.get("/admin/login", response_class=HTMLResponse)
+def admin_login_page():
+    return LOGIN_HTML.replace("__ERROR__", "")
+
+@app.post("/admin/login")
+async def admin_login(request: Request):
+    if not ADMIN_PASSWORD:
+        return HTMLResponse(
+            LOGIN_HTML.replace("__ERROR__", '<div class="err">ADMIN_PASSWORD غير مضبوط في متغيرات البيئة</div>'),
+            status_code=500,
+        )
+    form = await request.form()
+    if form.get("password", "") == ADMIN_PASSWORD:
+        resp = RedirectResponse(url="/admin", status_code=303)
+        resp.set_cookie("admin_token", _admin_token(), httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30)
+        return resp
+    return HTMLResponse(LOGIN_HTML.replace("__ERROR__", '<div class="err">كلمة المرور غير صحيحة</div>'), status_code=401)
+
+@app.get("/admin/logout")
+def admin_logout():
+    resp = RedirectResponse(url="/admin/login")
+    resp.delete_cookie("admin_token")
+    return resp
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_dashboard(request: Request):
+    if not _is_admin(request):
+        return RedirectResponse(url="/admin/login")
+    return DASHBOARD_HTML
+
+@app.get("/admin/api/conversations")
+def admin_api_conversations(request: Request):
+    if not _is_admin(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return {"conversations": list_conversations()}
+
+@app.get("/admin/api/messages/{phone}")
+def admin_api_messages(phone: str, request: Request):
+    if not _is_admin(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return {"messages": get_messages(phone)}
+
+@app.post("/admin/api/reply/{phone}")
+async def admin_api_reply(phone: str, request: Request):
+    if not _is_admin(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "empty"}, status_code=400)
+    
+    wa_send_text(phone, text)
+    log_message(phone, "admin", text)
+    set_conversation_status(phone, "handed_off")
+    return {"status": "sent"}
+
+@app.post("/admin/api/status/{phone}")
+async def admin_api_set_status(phone: str, request: Request):
+    if not _is_admin(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    body = await request.json()
+    new_status = body.get("status")
+    if new_status not in ("bot", "handed_off", "closed"):
+        return JSONResponse({"error": "invalid status"}, status_code=400)
+    set_conversation_status(phone, new_status)
+    return {"status": "ok"}
