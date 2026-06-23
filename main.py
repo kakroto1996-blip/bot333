@@ -389,7 +389,6 @@ def verify(request: Request):
 
 @app.post("/webhook")
 async def webhook(request: Request, background: BackgroundTasks):
-    """استقبال رسائل واتساب - يرد 200 فوراً ثم يعالج في الخلفية."""
     data = await request.json()
 
     if data.get("object") != "whatsapp_business_account":
@@ -405,7 +404,6 @@ async def webhook(request: Request, background: BackgroundTasks):
         from_number = message["from"]
         display     = value["metadata"]["display_phone_number"]
 
-        # تجاهل رسائل النظام والبوت نفسه
         if from_number == display:
             return JSONResponse({"status": "self"})
 
@@ -417,19 +415,12 @@ async def webhook(request: Request, background: BackgroundTasks):
         else:
             return JSONResponse({"status": "unsupported"})
 
-        # ← الرد على WhatsApp فوراً بـ 200، ثم المعالجة في الخلفية
         background.add_task(handle_message, from_number, user_input)
 
     except (KeyError, IndexError) as e:
         log.warning("Parse error: %s", e)
 
     return JSONResponse({"status": "ok"})
-
-
-@app.get("/health")
-def health():
-    return {"status": "running", "model": MODEL}
-
 
 # ─── 🎛️ قسم لوحة التحكم المضافة بالكامل أسفل الكود دون المساس بالبنية ─────────────────
 
