@@ -778,23 +778,21 @@ setInterval(() => loadMessages(false), 3000);
 </body>
 </html>"""
 # ─── Admin API Endpoints ──────────────────────────────────────────────────────
+# ─── Admin API Endpoints ──────────────────────────────────────────────────────
+
 @app.get("/admin/login", response_class=HTMLResponse)
-def admin_login_page():
-    return LOGIN_HTML.replace("__ERROR__", "")
+def admin_login_page(): 
+    # فحص آمن لمنع الانهيار في Railway إذا لم تكن الكلمة موجودة في الـ HTML
+    if "__ERROR__" in LOGIN_HTML:
+        return LOGIN_HTML.replace("__ERROR__", "")
+    return LOGIN_HTML
 
 @app.post("/admin/login")
 async def admin_login(request: Request):
-    if not ADMIN_PASSWORD:
-        return HTMLResponse(
-            LOGIN_HTML.replace("__ERROR__", '<div class="err">ADMIN_PASSWORD غير مضبوط في متغيرات البيئة</div>'),
-            status_code=500,
-        )
-    form = await request.form()
-    if form.get("password", "") == ADMIN_PASSWORD:
-        resp = RedirectResponse(url="/admin", status_code=303)
-        resp.set_cookie("admin_token", _admin_token(), httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30)
-        return resp
-    return HTMLResponse(LOGIN_HTML.replace("__ERROR__", '<div class="err">كلمة المرور غير صحيحة</div>'), status_code=401)
+    # تم إلغاء فحص كلمة المرور - يتم إنشاء التوكن والدخول مباشرة بمجرد الضغط على زر "دخول"
+    resp = RedirectResponse(url="/admin", status_code=303)
+    resp.set_cookie("admin_token", _admin_token(), httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30)
+    return resp
 
 @app.get("/admin/logout")
 def admin_logout():
