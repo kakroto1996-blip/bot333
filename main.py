@@ -38,7 +38,6 @@ OPENROUTER_KEY   = os.environ["OPENROUTER_API_KEY"]
 MODEL            = os.environ.get("AI_MODEL", "openai/gpt-4o-mini")
 DB_PATH          = os.environ.get("DB_PATH", "sessions.db")
 
-# ─── Google Sheets + Gmail (اختياري: البوت يعمل حتى لو لم تُضبط هذه القيم) ───
 GOOGLE_SHEET_ID              = os.environ.get("GOOGLE_SHEET_ID", "")
 GOOGLE_SERVICE_ACCOUNT_JSON  = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 RESEND_API_KEY               = os.environ.get("RESEND_API_KEY", "")
@@ -76,8 +75,7 @@ ai = OpenAI(
 # ─── SQLite Sessions ──────────────────────────────────────────────────────────
 def init_db() -> None:
     con = sqlite3.connect(DB_PATH)
-    con.execute("PRAGMA journal_mode=WAL;")  # يحسّن التزامن عند الكتابة المتعددة
-    # أضفنا حقل status للتفريق بين العميل النشط مع البوت 'bot' والعميل المحول للموظف 'agent'
+    con.execute("PRAGMA journal_mode=WAL;")
     con.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             phone TEXT PRIMARY KEY,
@@ -106,14 +104,6 @@ def save_session(phone: str, history: list[dict], status: str = "bot") -> None:
     con.commit()
     con.close()
 
-# بدلاً من الحذف الكلي مباشرة، يتم وسمها فقط كـ 'agent' لتعرض في لوحة الإدارة
-def mark_as_agent(phone: str) -> None:
-    con = sqlite3.connect(DB_PATH)
-    con.execute("UPDATE sessions SET status='agent' WHERE phone=?", (phone,))
-    con.commit()
-    con.close()
-    log.info("Session updated to agent status for %s", phone)
-
 def delete_session(phone: str) -> None:
     con = sqlite3.connect(DB_PATH)
     con.execute("DELETE FROM sessions WHERE phone=?", (phone,))
@@ -121,7 +111,6 @@ def delete_session(phone: str) -> None:
     con.close()
     log.info("Session deleted for %s", phone)
 
-# دالة مساعدة جديدة للوحة التحكم لجلب العملاء المحولين
 def get_all_agent_sessions() -> list[dict]:
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -138,22 +127,28 @@ def get_all_agent_sessions() -> list[dict]:
                 if match:
                     name = match.group(1).strip()
                     break
-        result.append({"phone": r["phone"], "name": name, "history": history})
+        
+        # تنظيف النصوص البرمجية من علامة [DONE] قبل إرسالها للوحة التحكم
+        clean_history = []
+        for msg in history:
+            clean_content = msg["content"].replace("[DONE]", "").strip()
+            clean_history.append({"role": msg["role"], "content": clean_content})
+
+        result.append({"phone": r["phone"], "name": name, "history": clean_history})
     return result
 
 # ─── Per-Phone Locks ──────────────────────────────────────────────────────────
 _phone_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
-_locks_guard = threading.Lock()  # يحمي القاموس نفسه عند إنشاء قفل جديد
+_locks_guard = threading.Lock()
 
 def get_phone_lock(phone: str) -> threading.Lock:
     with _locks_guard:
         return _phone_locks[phone]
 
 # ─── Google Sheets ────────────────────────────────────────────────────────────
-_sheets_client = None  # يُهيَّأ مرة واحدة فقط ويُعاد استخدامه (تجنّب إعادة المصادقة كل مرة)
+_sheets_client = None
 
 def get_sheet():
-    """يرجع أول ورقة (worksheet) في الشيت، أو None إذا لم تُضبط الإعدادات أو فشل الاتصال."""
     global _sheets_client
     if not GOOGLE_SHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
         return None
@@ -187,7 +182,7 @@ def log_to_sheet(whatsapp_phone: str, name: str, national_id: str, contact_phone
     except Exception as e:
         log.error("فشل حفظ الصف في Google Sheet: %s", e)
 
-# ─── Gmail Notification (عبر Resend HTTPS API - يعمل على أي خطة Railway) ────
+# ─── Email Notification ───────────────────────────────────────────────────────
 def send_notification_email(whatsapp_phone: str, name: str, national_id: str, contact_phone: str) -> None:
     if not (RESEND_API_KEY and NOTIFY_EMAIL):
         log.warning("إعدادات البريد غير مُفعّلة - تم تخطي إرسال الإشعار")
@@ -223,12 +218,7 @@ def send_notification_email(whatsapp_phone: str, name: str, national_id: str, co
     except Exception as e:
         log.error("فشل إرسال إشعار البريد: %s", e)
 
-# ─── استخراج بيانات العميل من رسالة الختام ────────────────────────────────────
 def extract_customer_data(final_message: str, last_user_input: str) -> dict | None:
-    """
-    الاسم ورقم الهوية يُستخرجان من رسالة الختام الثابتة الصيغة (محدّدة حرفياً في الـ System Prompt).
-    رقم الجوال هو آخر رسالة أرسلها المستخدم في هذه الجولة (لأنه آخر حقل يُطلب في التسلسل).
-    """
     match = re.search(r"شكراً لك يا (.+?)\.\s*صاحب الهوية \((.+?)\)", final_message)
     if not match:
         log.warning("تعذّر استخراج بيانات العميل من رسالة الختام: %s", final_message)
@@ -281,7 +271,6 @@ class BotState(TypedDict):
     done: bool
 
 def ai_node(state: BotState) -> BotState:
-    # 1. إعداد الـ history
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
     for msg in state["messages"]:
         if isinstance(msg, HumanMessage):
@@ -289,19 +278,15 @@ def ai_node(state: BotState) -> BotState:
         elif isinstance(msg, AIMessage):
             history.append({"role": "assistant", "content": msg.content})
 
-    # 2. استدعاء النموذج
     response = ai.chat.completions.create(model=MODEL, messages=history)
     reply = response.choices[0].message.content or ""
 
     done = "[DONE]" in reply
     clean = reply.replace("[DONE]", "").strip()
 
-    # 3. إرسال الرد على واتساب
     wa_send_text(state["phone"], clean)
-
     return {"messages": [AIMessage(content=reply)], "done": done}
 
-# بناء الجراف — عقدة واحدة تُنفَّذ مرة واحدة بالضبط لكل رسالة واردة
 builder = StateGraph(BotState)
 builder.add_node("ai", ai_node)
 builder.set_entry_point("ai")
@@ -312,12 +297,10 @@ graph = builder.compile()
 def handle_message(phone: str, user_input: str) -> None:
     lock = get_phone_lock(phone)
     with lock:
-        # فحص حالة المحادثة أولاً لمنع رد البوت التلقائي إذا تحولت للموظف
         con = sqlite3.connect(DB_PATH)
         row = con.execute("SELECT status FROM sessions WHERE phone=?", (phone,)).fetchone()
         con.close()
         if row and row[0] == "agent":
-            # العميل يتحدث مع الموظف الآن، نقوم فقط بحفظ رسالته في السجل ليراها الموظف في اللوحة
             history = load_session(phone)
             history.append({"role": "user", "content": user_input})
             save_session(phone, history, status="agent")
@@ -326,18 +309,12 @@ def handle_message(phone: str, user_input: str) -> None:
         history = load_session(phone)
 
         if not history:
-            # 1. إرسال الأزرار
             wa_send_buttons(phone)
-
-            # 2. حفظ رسالة الترحيب في الـ history فوراً لمنع تكرارها
-            welcome_msg = "مرحباً بك! 👋 كيف يمكنني مساعدتك اليوم?"
+            welcome_msg = "مرحباً بك! 👋 كيف يمكنني مساعدتك اليوم؟"
             new_history = [{"role": "assistant", "content": welcome_msg}]
             save_session(phone, new_history)
-
-            log.info("New user %s - buttons sent and session initialized", phone)
             return
 
-        # تحويل history إلى LangGraph messages
         messages = []
         for item in history:
             if item["role"] == "user":
@@ -348,7 +325,6 @@ def handle_message(phone: str, user_input: str) -> None:
 
         state = graph.invoke({"messages": messages, "phone": phone, "done": False})
 
-        # حفظ المحادثة المحدّثة
         new_history = history + [
             {"role": "user",      "content": user_input},
             {"role": "assistant", "content": state["messages"][-1].content},
@@ -361,7 +337,6 @@ def handle_message(phone: str, user_input: str) -> None:
                 log_to_sheet(phone, data["name"], data["national_id"], data["contact_phone"])
                 send_notification_email(phone, data["name"], data["national_id"], data["contact_phone"])
             
-            # تم استبدال delete_session بـ save_session مع حالة agent لتثبيتها في اللوحة
             save_session(phone, new_history, status="agent")
             log.info("Conversation successfully completed and routed to dashboard for %s", phone)
         else:
@@ -376,16 +351,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="WhatsApp AI Bot", lifespan=lifespan)
 
-
 @app.get("/webhook")
 def verify(request: Request):
-    """التحقق من الويب هوك مع Meta."""
     params = request.query_params
     if params.get("hub.mode") == "subscribe" and params.get("hub.verify_token") == VERIFY_TOKEN:
         log.info("Webhook verified ✓")
         return PlainTextResponse(params.get("hub.challenge", ""))
     return PlainTextResponse("Forbidden", status_code=403)
-
 
 @app.post("/webhook")
 async def webhook(request: Request, background: BackgroundTasks):
@@ -395,14 +367,14 @@ async def webhook(request: Request, background: BackgroundTasks):
         return JSONResponse({"status": "ignored"})
 
     try:
-        value    = data["entry"][0]["changes"][0]["value"]
+        value = data["entry"][0]["changes"][0]["value"]
         messages = value.get("messages")
         if not messages:
             return JSONResponse({"status": "no_messages"})
 
-        message     = messages[0]
+        message = messages[0]
         from_number = message["from"]
-        display     = value["metadata"]["display_phone_number"]
+        display = value["metadata"]["display_phone_number"]
 
         if from_number == display:
             return JSONResponse({"status": "self"})
@@ -422,7 +394,11 @@ async def webhook(request: Request, background: BackgroundTasks):
 
     return JSONResponse({"status": "ok"})
 
-# ─── 🎛️ قسم لوحة التحكم المضافة بالكامل أسفل الكود دون المساس بالبنية ─────────────────
+@app.get("/health")
+def health():
+    return {"status": "running", "model": MODEL}
+
+# ─── 🎛️ قسم لوحة التحكم المصغرة ──────────────────────────────────────────────────
 
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -442,7 +418,6 @@ DASHBOARD_HTML = """
     </header>
 
     <main class="flex-1 p-4 max-w-6xl w-full mx-auto grid grid-cols-1 md:grid-cols-3 gap-4">
-        <!-- القائمة اليمنى -->
         <div class="bg-white rounded-lg shadow p-3 col-span-1 overflow-y-auto max-h-[78vh]">
             <h2 class="font-bold text-gray-700 mb-3 border-b pb-1 text-sm">📥 عملاء جاهزون للرد</h2>
             {% if not sessions %}
@@ -456,7 +431,6 @@ DASHBOARD_HTML = """
             {% endfor %}
         </div>
 
-        <!-- ساحة المحادثة -->
         <div class="bg-white rounded-lg shadow col-span-2 flex flex-col max-h-[78vh]">
             {% if active_session %}
                 <div class="p-3 border-b bg-gray-50 flex justify-between items-center rounded-t-lg">
@@ -483,7 +457,7 @@ DASHBOARD_HTML = """
                             <div class="flex justify-end">
                                 <div class="bg-blue-600 text-white rounded-lg p-3 max-w-sm shadow-sm text-xs">
                                     <span class="block text-[10px] font-bold text-blue-200 mb-0.5">النظام / أنت</span>
-                                    {{ msg.content | replace("[DONE]", "") }}
+                                    {{ msg.content }}
                                 </div>
                             </div>
                         {% endif %}
