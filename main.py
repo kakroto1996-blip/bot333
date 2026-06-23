@@ -128,7 +128,6 @@ def get_all_agent_sessions() -> list[dict]:
                     name = match.group(1).strip()
                     break
         
-        # تنظيف النصوص البرمجية من علامة [DONE] قبل إرسالها للوحة التحكم
         clean_history = []
         for msg in history:
             clean_content = msg["content"].replace("[DONE]", "").strip()
@@ -308,12 +307,20 @@ def handle_message(phone: str, user_input: str) -> None:
 
         history = load_session(phone)
 
-        if not history:
+        # إذا ضغط المستخدم على الأزرار لأول مرة أو أرسل كلمة ترحيبية وليس هناك سجل
+        # أو إذا كانت كلمة الإدخال هي أحد عناوين الأزرار نفسها لضمان المزامنة
+        is_button_click = user_input in ["📦 تتبع الطلب", "🛠 الدعم الفني"]
+
+        if not history and not is_button_click:
             wa_send_buttons(phone)
             welcome_msg = "مرحباً بك! 👋 كيف يمكنني مساعدتك اليوم؟"
             new_history = [{"role": "assistant", "content": welcome_msg}]
-            save_session(phone, new_history)
+            save_session(phone, new_history, status="bot")
             return
+
+        # إذا كانت جلسة جديدة ولكن دخل بضغطة زر مباشرة، نقوم بإنشاء سجل تمهيدي له
+        if not history and is_button_click:
+            history = [{"role": "assistant", "content": "مرحباً بك! 👋 كيف يمكنني مساعدتك اليوم؟"}]
 
         messages = []
         for item in history:
@@ -350,6 +357,11 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="WhatsApp AI Bot", lifespan=lifespan)
+
+# تحويل الرابط الرئيسي تلقائياً للـ Dashboard لمنع خطأ 404
+@app.get("/")
+def home_redirect():
+    return RedirectResponse(url="/dashboard")
 
 @app.get("/webhook")
 def verify(request: Request):
