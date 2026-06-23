@@ -405,40 +405,60 @@ graph = builder.compile()
 def handle_message(phone: str, user_input: str) -> None:
     lock = get_phone_lock(phone)
     with lock:
-        history = load_session(phone)
+        try:
+            history = load_session(phone)
 
-        if not history:
-            # 1. إرسال الأزرار
-            wa_send_buttons(phone)
+            if not history:
+                # 1. إرسال الأزرار
+                wa_send_buttons(phone)
 
-            # 2. حفظ رسالة الترحيب في الـ history فوراً لمنع تكرارها
-            welcome_msg = "مرحباً بك! 👋 كيف يمكنني مساعدتك اليوم؟"
-            new_history = [{"role": "assistant", "content": welcome_msg}]
-            save_session(phone, new_history)
+                # 2. حفظ رسالة الترحيب في الـ history فوراً لمنع تكرارها
+                welcome_msg = "مرحباً بك! 👋 كيف يمكنني مساعدتك اليوم؟"
+                new_history = [{"role": "assistant", "content": welcome_msg}]
+                save_session(phone, new_history)
 
-            log.info("New user %s - buttons sent and session initialized", phone)
-            return
+                log.info("New user %s - buttons sent and session initialized", phone)
+                return
 
-        # تحويل history إلى LangGraph messages
-        messages = []
-        for item in history:
-            if item["role"] == "user":
-                messages.append(HumanMessage(content=item["content"]))
+            # تحويل history إلى LangGraph messages
+            messages = []
+            for item in history:
+                if item["role"] == "user":
+                    messages.append(HumanMessage(content=item["content"]))
+                else:
+                    messages.append(AIMessage(content=item["content"]))
+            messages.append(HumanMessage(content=user_input))
+
+            # استدعاء الـ graph مع معالجة الأخطاء
+            try:
+                state = graph.invoke({"messages": messages, "phone": phone, "done": False})
+            except Exception as e:
+                log.error("خطأ في معالجة الرسالة مع AI Model: %s", str(e))
+                wa_send_text(phone, "عذراً، حدث خلل مؤقت في معالجة رسالتك. يرجى المحاولة لاحقاً.")
+                return
+
+            if state.get("done"):
+                delete_session(phone)
             else:
-                messages.append(AIMessage(content=item["content"]))
-        messages.append(HumanMessage(content=user_input))
-
-        state = graph.invoke({"messages": messages, "phone": phone, "done": False})
-
-        if state.get("done"):
-            delete_session(phone)
-        else:
-            # حفظ المحادثة المحدّثة
-            new_history = history + [
-                {"role": "user",      "content": user_input},
-                {"role": "assistant", "content": state["messages"][-1].content},
-            ]
-            save_session(phone, new_history)
+                # حفظ المحادثة المحدّثة - مع تجنب الأخطاء
+                assistant_content = ""
+                if state.get("messages") and len(state["messages"]) > 0:
+                    last_msg = state["messages"][-1]
+                    # تعامل آمن مع الرسالة
+                    if hasattr(last_msg, 'content'):
+                        assistant_content = last_msg.content
+                    elif isinstance(last_msg, dict) and "content" in last_msg:
+                        assistant_content = last_msg["content"]
+                
+                if assistant_content:
+                    new_history = history + [
+                        {"role": "user",      "content": user_input},
+                        {"role": "assistant", "content": assistant_content},
+                    ]
+                    save_session(phone, new_history)
+        except Exception as e:
+            log.error("خطأ غير متوقع في معالجة الرسالة: %s", str(e))
+            wa_send_text(phone, "عذراً، حدث خطأ غير متوقع. يرجى المحاولة لاحقاً.")
 
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 @asynccontextmanager
